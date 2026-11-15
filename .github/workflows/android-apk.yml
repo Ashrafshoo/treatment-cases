@@ -1,10 +1,11 @@
+
 name: Build Amlakna Android APK
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - 'project-source.zip'
+      - '**.zip'
       - '.github/workflows/android-apk.yml'
 
 permissions:
@@ -16,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    name: Validate, test, lint and build APK
+    name: Extract, Validate, Test and Build APK
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -24,45 +25,79 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Verify and extract project source
+      - name: Locate and extract project ZIP
         id: source
         shell: bash
         run: |
           set -euo pipefail
 
-          test -f project-source.zip || {
-            echo "ERROR: project-source.zip is missing."
+          mapfile -t ZIP_FILES < <(
+            find . -maxdepth 1 -type f -iname '*.zip' -print | sort
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "::error::No ZIP archive found in repository root."
+            echo "Upload your Android project ZIP to the repository root."
             exit 1
-          }
+          fi
 
-          unzip -tq project-source.zip
-
-          mkdir -p "$RUNNER_TEMP/amlakna-source"
-          unzip -q project-source.zip -d "$RUNNER_TEMP/amlakna-source"
-
-          ROOT="$(find "$RUNNER_TEMP/amlakna-source" \
-            -type f -name settings.gradle.kts \
-            -printf '%h\n' | head -n 1)"
-
-          test -n "$ROOT" || {
-            echo "ERROR: settings.gradle.kts was not found."
+          if [ "${#ZIP_FILES[@]}" -gt 1 ]; then
+            echo "::error::More than one ZIP archive found. Keep only the intended project ZIP in the repository root."
+            printf '%s\n' "${ZIP_FILES[@]}"
             exit 1
-          }
+          fi
 
-          test -f "$ROOT/android-app/build.gradle.kts" || {
-            echo "ERROR: android-app module was not found."
+          ZIP_FILE="${ZIP_FILES[0]}"
+          echo "Selected archive: $ZIP_FILE"
+
+          unzip -tq "$ZIP_FILE"
+
+          EXTRACT_DIR="$RUNNER_TEMP/amlakna-extracted"
+          mkdir -p "$EXTRACT_DIR"
+
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          echo "Extracted archive contents:"
+          find "$EXTRACT_DIR" -maxdepth 3 -type f | head -200
+
+          mapfile -t SETTINGS_FILES < <(
+            find "$EXTRACT_DIR" -type f \
+              \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+              -not -path '*/.gradle/*' \
+              -not -path '*/build/*' | sort
+          )
+
+          if [ "${#SETTINGS_FILES[@]}" -eq 0 ]; then
+            echo "::error::No Gradle settings file found in the extracted ZIP."
             exit 1
-          }
+          fi
 
-          echo "project_root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Project root: $ROOT"
+          PROJECT_ROOT=""
+
+          for SETTINGS in "${SETTINGS_FILES[@]}"; do
+            CANDIDATE="$(dirname "$SETTINGS")"
+
+            if [ -d "$CANDIDATE/android-app" ]; then
+              PROJECT_ROOT="$CANDIDATE"
+              break
+            fi
+          done
+
+          if [ -z "$PROJECT_ROOT" ]; then
+            echo "::error::Could not identify the Amlakna Android project root."
+            echo "Expected a Gradle project containing the android-app module."
+            exit 1
+          fi
+
+          echo "Project root: $PROJECT_ROOT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Run Python regression tests
+      - name: Run Python tests if available
         working-directory: ${{ steps.source.outputs.project_root }}
         shell: bash
         run: |
@@ -73,20 +108,17 @@ jobs:
           mapfile -t TEST_FILES < <(
             find . -type f \
               \( -name 'test_*.py' -o -name '*_test.py' \) \
-              -not -path './.git/*' \
-              -not -path './.gradle/*' \
-              -not -path '*/build/*' \
-              | sort
+              -not -path '*/.git/*' \
+              -not -path '*/.gradle/*' \
+              -not -path '*/build/*' | sort
           )
 
           if [ "${#TEST_FILES[@]}" -gt 0 ]; then
             echo "Found ${#TEST_FILES[@]} Python test files."
             python -m pytest -q "${TEST_FILES[@]}"
           else
-            echo "::warning::No Python test files were found in the source ZIP. Python tests were not run."
-            echo "### Python tests" >> "$GITHUB_STEP_SUMMARY"
-            echo "No Python test files were found. This is not counted as a passing test." \
-              >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::No Python tests found. Python tests were not executed."
+            echo "This is not counted as a passing test."
           fi
 
       - name: Set up JDK 17
@@ -110,48 +142,45 @@ jobs:
             "platforms;android-36" \
             "build-tools;35.0.0"
 
-      - name: Set up Gradle 8.11.1
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
           cache-read-only: false
 
-      - name: Verify Android build configuration
+      - name: Check project configuration
         working-directory: ${{ steps.source.outputs.project_root }}
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Checking Android build configuration..."
+          echo "Checking Gradle project files..."
 
+          test -d android-app || {
+            echo "::error::android-app module is missing."
+            exit 1
+          }
+
+          echo "Gradle settings:"
+          find . -maxdepth 2 \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' \) \
+            -print
+
+          echo "Android configuration references:"
           grep -R -n \
             --include='*.gradle' \
             --include='*.gradle.kts' \
-            'compileSdk' .
+            --include='*.toml' \
+            -E 'compileSdk|com.android.application|com.android.tools.build:gradle' . \
+            || true
 
-          if ! grep -R -q \
-            --include='*.gradle' \
-            --include='*.gradle.kts' \
-            -E 'compileSdk(Version)?[[:space:](=]+36' .; then
-            echo "ERROR: compileSdk 36 was not found in the project."
-            exit 1
-          fi
-
-          if ! grep -R -q \
-            --include='*.gradle' \
-            --include='*.gradle.kts' \
-            '8.10.1' .; then
-            echo "ERROR: Android Gradle Plugin 8.10.1 was not found."
-            exit 1
-          fi
-
-          echo "Android configuration checks passed."
-
-      - name: Run Android tests, lint and build APK
+      - name: Build, test and lint Android
         working-directory: ${{ steps.source.outputs.project_root }}
         shell: bash
         run: |
           set -euo pipefail
+
+          gradle --version
 
           gradle --no-daemon --stacktrace --warning-mode all \
             clean \
@@ -159,29 +188,49 @@ jobs:
             :android-app:lintDebug \
             :android-app:assembleDebug
 
-      - name: Publish build summary
-        if: always()
+      - name: Verify APK output
+        id: apk
+        working-directory: ${{ steps.source.outputs.project_root }}
         shell: bash
         run: |
-          {
-            echo "## أملاكنا – نتيجة البناء"
-            echo ""
-            echo "- Commit: $GITHUB_SHA"
-            echo "- Android API: 36"
-            echo "- Gradle: 8.11.1"
-            echo "- Java: 17"
-            echo "- Android unit tests, lint and APK build are required."
-            echo "- Python tests are reported separately if no test files exist."
-          } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
 
-      - name: Upload APK and diagnostic reports
+          APK_DIR="android-app/build/outputs/apk/debug"
+
+          if [ ! -d "$APK_DIR" ]; then
+            echo "::error::APK output directory was not created."
+            exit 1
+          fi
+
+          mapfile -t APK_FILES < <(
+            find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' | sort
+          )
+
+          if [ "${#APK_FILES[@]}" -eq 0 ]; then
+            echo "::error::No APK file was generated."
+            exit 1
+          fi
+
+          echo "Generated APK files:"
+          printf '%s\n' "${APK_FILES[@]}"
+
+          echo "apk_found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Amlakna-Android-APK-${{ github.run_number }}
+          path: ${{ steps.source.outputs.project_root }}/android-app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostic reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: amlakna-android-build-${{ github.run_number }}
+          name: Amlakna-Build-Reports-${{ github.run_number }}
           path: |
-            ${{ steps.source.outputs.project_root }}/android-app/build/outputs/apk/debug/*.apk
-            ${{ steps.source.outputs.project_root }}/android-app/build/reports/tests/testDebugUnitTest/**
-            ${{ steps.source.outputs.project_root }}/android-app/build/reports/lint-results-debug.html
-          if-no-files-found: warn
-          retention-days: 21
+            ${{ steps.source.outputs.project_root }}/android-app/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 14

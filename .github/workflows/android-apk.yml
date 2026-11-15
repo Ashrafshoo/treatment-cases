@@ -51,11 +51,12 @@ jobs:
           python -m pytest -q
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+          # Gradle caching is handled by gradle/actions/setup-gradle below,
+          # after the ZIP source has been extracted.
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3

@@ -55,12 +55,10 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-          # Gradle caching is handled by gradle/actions/setup-gradle below.
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
-          # Install required SDK packages explicitly in the next step.
           packages: ''
 
       - name: Install Android SDK packages
@@ -85,6 +83,21 @@ jobs:
             :android-app:testDebugUnitTest \
             :android-app:lintDebug \
             :android-app:assembleDebug
+
+      - name: Verify APK exists
+        working-directory: ${{ steps.source.outputs.project_root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="android-app/build/outputs/apk/debug"
+          mapfile -t APKS < <(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' -size +0c -print 2>/dev/null)
+          if [ "${#APKS[@]}" -eq 0 ]; then
+            echo "No non-empty debug APK found in $APK_DIR"
+            find android-app/build/outputs -maxdepth 5 -type f -name '*.apk' -print 2>/dev/null || true
+            exit 1
+          fi
+          printf '%s\n' "${APKS[@]}"
+          ls -lh "${APKS[@]}"
 
       - name: Publish build summary
         if: always()
